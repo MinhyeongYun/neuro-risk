@@ -1,0 +1,799 @@
+from __future__ import annotations
+
+import json
+import warnings
+from pathlib import Path
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+    precision_recall_curve,
+    average_precision_score,
+)
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+RANDOM_SEED = 42
+OUTPUT_DIR = Path("paper_grade_risk_model_output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+N_SUBJECTS = 900
+N_DAYS = 21
+N_BOOTSTRAP = 120
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def sigmoid(x: np.ndarray | float) -> np.ndarray | float:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def safe_auc(y_true, prob):
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, prob))
+
+
+def save_json(obj, path: Path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+# ============================================================
+# 1. SYNTHETIC LONGITUDINAL DATA GENERATION
+# ============================================================
+
+def generate_dynamic_psychiatric_dataset(
+    n_subjects: int = N_SUBJECTS,
+    n_days: int = N_DAYS,
+    seed: int = RANDOM_SEED,
+):
+    """
+    Paper-grade synthetic longitudinal dataset.
+
+    Core idea:
+    - Each person has a latent vulnerability trait.
+    - Daily risk evolves dynamically.
+    - Outcome is not generated from one static score.
+    - Risk is affected by stress, sleep, depression, trauma, social support,
+      alcohol use, impulsivity, and prior-day deterioration.
+
+    This mimics computational psychiatry logic:
+    latent vulnerability + dynamic state change + observable behavior.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    daily_rows = []
+    subject_rows = []
+
+    for subject_id in range(n_subjects):
+        age = int(rng.integers(20, 61))
+        sex_male = int(rng.choice([0, 1], p=[0.48, 0.52]))
+        trauma_history = int(rng.choice([0, 1], p=[0.62, 0.38]))
+
+        latent_vulnerability = rng.normal(
+            loc=0.35 * trauma_history + 0.15 * sex_male,
+            scale=1.0,
+        )
+
+        trait_impulsivity = np.clip(
+            rng.normal(4.5 + 1.1 * latent_vulnerability + 0.4 * sex_male, 1.7),
+            0,
+            10,
+        )
+
+        trait_emotion_dysregulation = np.clip(
+            rng.normal(5.0 + 1.3 * latent_vulnerability + 0.7 * trauma_history, 1.6),
+            0,
+            10,
+        )
+
+        baseline_depression = np.clip(
+            rng.normal(8.0 + 3.2 * trauma_history + 2.0 * latent_vulnerability, 4.0),
+            0,
+            27,
+        )
+
+        baseline_anxiety = np.clip(
+            rng.normal(7.0 + 2.5 * trauma_history + 1.6 * latent_vulnerability, 3.5),
+            0,
+            21,
+        )
+
+        prior_dynamic_risk = sigmoid(-3.0 + 0.6 * latent_vulnerability)
+        cumulative_crisis_burden = 0.0
+
+        for day in range(1, n_days + 1):
+            weekday_pressure = 0.6 * np.sin(2 * np.pi * day / 7)
+            random_shock = rng.normal(0, 1)
+
+            stress = np.clip(
+                rng.normal(
+                    4.8
+                    + 0.08 * day
+                    + 0.75 * latent_vulnerability
+                    + 0.45 * weekday_pressure
+                    + 0.35 * random_shock,
+                    1.8,
+                ),
+                0,
+                10,
+            )
+
+            sleep = np.clip(
+                rng.normal(
+                    7.4
+                    - 0.28 * stress
+                    - 0.18 * latent_vulnerability
+                    - 0.10 * cumulative_crisis_burden,
+                    1.1,
+                ),
+                2.5,
+                10,
+            )
+
+            depression = np.clip(
+                rng.normal(
+                    baseline_depression
+                    + 0.24 * stress
+                    - 0.32 * sleep
+                    + 0.12 * cumulative_crisis_burden,
+                    2.7,
+                ),
+                0,
+                27,
+            )
+
+            anxiety = np.clip(
+                rng.normal(
+                    baseline_anxiety
+                    + 0.28 * stress
+                    - 0.18 * sleep
+                    + 0.08 * cumulative_crisis_burden,
+                    2.4,
+                ),
+                0,
+                21,
+            )
+
+            social_support = np.clip(
+                rng.normal(
+                    6.4
+                    - 0.45 * latent_vulnerability
+                    - 0.28 * stress
+                    + 0.15 * sleep,
+                    1.8,
+                ),
+                0,
+                10,
+            )
+
+            alcohol_use = np.clip(
+                rng.normal(
+                    1.8
+                    + 0.22 * stress
+                    + 0.10 * depression
+                    + 0.20 * sex_male,
+                    1.8,
+                ),
+                0,
+                10,
+            )
+
+            occupational_burden = np.clip(
+                rng.normal(
+                    4.0
+                    + 0.22 * stress
+                    + 0.35 * random_shock
+                    + 0.05 * day,
+                    1.5,
+                ),
+                0,
+                10,
+            )
+
+            daily_linear_risk = (
+                -5.1
+                + 0.11 * depression
+                + 0.11 * anxiety
+                + 0.18 * stress
+                - 0.26 * sleep
+                - 0.20 * social_support
+                + 0.13 * alcohol_use
+                + 0.18 * occupational_burden
+                + 0.32 * trait_impulsivity
+                + 0.28 * trait_emotion_dysregulation
+                + 0.75 * trauma_history
+                + 0.35 * sex_male
+                + 0.90 * latent_vulnerability
+                + 1.15 * prior_dynamic_risk
+            )
+
+            daily_risk_probability = sigmoid(daily_linear_risk)
+
+            crisis_day = int(rng.binomial(1, daily_risk_probability))
+            suicidal_ideation = int(
+                rng.binomial(
+                    1,
+                    sigmoid(
+                        -4.0
+                        + 0.13 * depression
+                        + 0.15 * stress
+                        - 0.18 * social_support
+                        + 0.45 * latent_vulnerability
+                    ),
+                )
+            )
+
+            cumulative_crisis_burden += 0.65 * crisis_day + 0.25 * suicidal_ideation
+
+            prior_dynamic_risk = (
+                0.72 * prior_dynamic_risk
+                + 0.28 * daily_risk_probability
+            )
+
+            daily_rows.append(
+                {
+                    "subject_id": subject_id,
+                    "day": day,
+                    "age": age,
+                    "sex_male": sex_male,
+                    "trauma_history": trauma_history,
+                    "latent_vulnerability_true": latent_vulnerability,
+                    "trait_impulsivity": trait_impulsivity,
+                    "trait_emotion_dysregulation": trait_emotion_dysregulation,
+                    "stress": stress,
+                    "sleep": sleep,
+                    "depression": depression,
+                    "anxiety": anxiety,
+                    "social_support": social_support,
+                    "alcohol_use": alcohol_use,
+                    "occupational_burden": occupational_burden,
+                    "suicidal_ideation": suicidal_ideation,
+                    "daily_risk_probability_true": daily_risk_probability,
+                    "crisis_day": crisis_day,
+                }
+            )
+
+        subject_rows.append(
+            {
+                "subject_id": subject_id,
+                "latent_vulnerability_true": latent_vulnerability,
+            }
+        )
+
+    daily_df = pd.DataFrame(daily_rows)
+
+    daily_df.to_csv(
+        OUTPUT_DIR / "synthetic_daily_dynamic_data.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    subject_df = create_subject_level_features(daily_df)
+    subject_df.to_csv(
+        OUTPUT_DIR / "synthetic_subject_level_features.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    return daily_df, subject_df
+
+
+# ============================================================
+# 2. FEATURE ENGINEERING
+# ============================================================
+
+def slope_feature(x):
+    x = np.asarray(x)
+    if len(x) < 2:
+        return 0.0
+    return float(np.polyfit(np.arange(len(x)), x, 1)[0])
+
+
+def late_minus_early(x):
+    x = np.asarray(x)
+    half = len(x) // 2
+    return float(np.mean(x[half:]) - np.mean(x[:half]))
+
+
+def instability(x):
+    x = np.asarray(x)
+    return float(np.std(np.diff(x))) if len(x) > 2 else 0.0
+
+
+def create_subject_level_features(daily_df: pd.DataFrame) -> pd.DataFrame:
+    grouped = daily_df.groupby("subject_id")
+
+    subject_df = grouped.agg(
+        age=("age", "first"),
+        sex_male=("sex_male", "first"),
+        trauma_history=("trauma_history", "first"),
+        latent_vulnerability_true=("latent_vulnerability_true", "first"),
+        trait_impulsivity=("trait_impulsivity", "first"),
+        trait_emotion_dysregulation=("trait_emotion_dysregulation", "first"),
+
+        stress_mean=("stress", "mean"),
+        stress_max=("stress", "max"),
+        stress_slope=("stress", slope_feature),
+        stress_change=("stress", late_minus_early),
+        stress_instability=("stress", instability),
+
+        sleep_mean=("sleep", "mean"),
+        sleep_min=("sleep", "min"),
+        sleep_slope=("sleep", slope_feature),
+        sleep_change=("sleep", late_minus_early),
+        sleep_instability=("sleep", instability),
+
+        depression_mean=("depression", "mean"),
+        depression_max=("depression", "max"),
+        depression_slope=("depression", slope_feature),
+        depression_change=("depression", late_minus_early),
+
+        anxiety_mean=("anxiety", "mean"),
+        anxiety_slope=("anxiety", slope_feature),
+
+        social_support_mean=("social_support", "mean"),
+        social_support_slope=("social_support", slope_feature),
+
+        alcohol_use_mean=("alcohol_use", "mean"),
+        occupational_burden_mean=("occupational_burden", "mean"),
+        occupational_burden_slope=("occupational_burden", slope_feature),
+
+        suicidal_ideation_days=("suicidal_ideation", "sum"),
+        crisis_days=("crisis_day", "sum"),
+        max_daily_true_risk=("daily_risk_probability_true", "max"),
+        mean_daily_true_risk=("daily_risk_probability_true", "mean"),
+    ).reset_index()
+
+    # Final outcome: whether a subject experienced at least one crisis day
+    subject_df["high_risk_event"] = (subject_df["crisis_days"] >= 1).astype(int)
+
+    # Latent vulnerability proxy:
+    # In real studies, this would be estimated through factor analysis,
+    # item-response theory, Bayesian latent variable modeling, or validated scales.
+    subject_df["latent_vulnerability_proxy"] = (
+        0.30 * subject_df["depression_mean"]
+        + 0.24 * subject_df["anxiety_mean"]
+        + 0.28 * subject_df["trait_emotion_dysregulation"]
+        + 0.22 * subject_df["trait_impulsivity"]
+        + 0.18 * subject_df["stress_mean"]
+        - 0.22 * subject_df["sleep_mean"]
+        - 0.20 * subject_df["social_support_mean"]
+    )
+
+    return subject_df
+
+
+# ============================================================
+# 3. MODEL DEFINITIONS
+# ============================================================
+
+def baseline_static_model():
+    return Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=4000,
+                    class_weight="balanced",
+                    random_state=RANDOM_SEED,
+                ),
+            ),
+        ]
+    )
+
+
+def dynamic_logistic_model():
+    return Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=5000,
+                    class_weight="balanced",
+                    C=0.75,
+                    random_state=RANDOM_SEED,
+                ),
+            ),
+        ]
+    )
+
+
+def random_forest_model():
+    return RandomForestClassifier(
+        n_estimators=350,
+        max_depth=5,
+        min_samples_leaf=10,
+        class_weight="balanced",
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+
+
+def gradient_boosting_model():
+    return GradientBoostingClassifier(
+        n_estimators=260,
+        learning_rate=0.035,
+        max_depth=2,
+        random_state=RANDOM_SEED,
+    )
+
+
+# ============================================================
+# 4. EVALUATION
+# ============================================================
+
+def evaluate_model(name, model, X_test, y_test):
+    prob = model.predict_proba(X_test)[:, 1]
+    pred = (prob >= 0.5).astype(int)
+
+    return {
+        "model": name,
+        "accuracy": float(accuracy_score(y_test, pred)),
+        "roc_auc": safe_auc(y_test, prob),
+        "average_precision": float(average_precision_score(y_test, prob)),
+        "brier_score": float(brier_score_loss(y_test, prob)),
+        "confusion_matrix": confusion_matrix(y_test, pred).tolist(),
+        "classification_report": classification_report(
+            y_test,
+            pred,
+            output_dict=True,
+            zero_division=0,
+        ),
+    }, prob, pred
+
+
+def bootstrap_uncertainty(model, X_train, y_train, X_test, n_bootstrap=N_BOOTSTRAP):
+    rng = np.random.default_rng(RANDOM_SEED + 100)
+    predictions = []
+
+    X_np = X_train.to_numpy()
+    y_np = y_train.to_numpy()
+
+    for _ in range(n_bootstrap):
+        idx = rng.choice(len(X_np), size=len(X_np), replace=True)
+        X_boot = pd.DataFrame(X_np[idx], columns=X_train.columns)
+        y_boot = pd.Series(y_np[idx])
+
+        m = clone(model)
+        m.fit(X_boot, y_boot)
+        predictions.append(m.predict_proba(X_test)[:, 1])
+
+    matrix = np.vstack(predictions)
+
+    return pd.DataFrame(
+        {
+            "risk_mean": matrix.mean(axis=0),
+            "risk_lower_95": np.percentile(matrix, 2.5, axis=0),
+            "risk_upper_95": np.percentile(matrix, 97.5, axis=0),
+            "uncertainty_width": np.percentile(matrix, 97.5, axis=0)
+            - np.percentile(matrix, 2.5, axis=0),
+        }
+    )
+
+
+def ablation_study(model, X_train, y_train, X_test, y_test):
+    feature_groups = {
+        "static_demographics": [
+            "age",
+            "sex_male",
+            "trauma_history",
+        ],
+        "clinical_means": [
+            "stress_mean",
+            "sleep_mean",
+            "depression_mean",
+            "anxiety_mean",
+            "social_support_mean",
+            "alcohol_use_mean",
+        ],
+        "dynamic_temporal_features": [
+            "stress_slope",
+            "stress_change",
+            "stress_instability",
+            "sleep_slope",
+            "sleep_change",
+            "sleep_instability",
+            "depression_slope",
+            "depression_change",
+            "anxiety_slope",
+            "social_support_slope",
+            "occupational_burden_slope",
+        ],
+        "latent_and_trait_features": [
+            "trait_impulsivity",
+            "trait_emotion_dysregulation",
+            "latent_vulnerability_proxy",
+        ],
+        "suicidal_ideation": [
+            "suicidal_ideation_days",
+        ],
+    }
+
+    results = []
+
+    all_features = list(X_train.columns)
+
+    full_model = clone(model)
+    full_model.fit(X_train, y_train)
+    full_prob = full_model.predict_proba(X_test)[:, 1]
+    full_auc = safe_auc(y_test, full_prob)
+    full_brier = float(brier_score_loss(y_test, full_prob))
+
+    results.append(
+        {
+            "condition": "FULL_MODEL",
+            "n_features": len(all_features),
+            "roc_auc": full_auc,
+            "brier_score": full_brier,
+            "auc_drop_from_full": 0.0,
+        }
+    )
+
+    for group_name, group_features in feature_groups.items():
+        remaining = [f for f in all_features if f not in group_features]
+
+        m = clone(model)
+        m.fit(X_train[remaining], y_train)
+        prob = m.predict_proba(X_test[remaining])[:, 1]
+
+        auc = safe_auc(y_test, prob)
+        brier = float(brier_score_loss(y_test, prob))
+
+        results.append(
+            {
+                "condition": f"REMOVE_{group_name}",
+                "n_features": len(remaining),
+                "roc_auc": auc,
+                "brier_score": brier,
+                "auc_drop_from_full": full_auc - auc,
+            }
+        )
+
+    df = pd.DataFrame(results)
+    df.to_csv(OUTPUT_DIR / "ablation_study.csv", index=False, encoding="utf-8-sig")
+    return df
+
+
+# ============================================================
+# 5. PLOTS
+# ============================================================
+
+def plot_roc(y_test, probabilities):
+    plt.figure(figsize=(7, 6))
+    for name, prob in probabilities.items():
+        fpr, tpr, _ = roc_curve(y_test, prob)
+        auc = roc_auc_score(y_test, prob)
+        plt.plot(fpr, tpr, label=f"{name} AUC={auc:.3f}")
+
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves: Model Comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "figure_1_roc_curves.png", dpi=220)
+    plt.close()
+
+
+def plot_precision_recall(y_test, probabilities):
+    plt.figure(figsize=(7, 6))
+    for name, prob in probabilities.items():
+        precision, recall, _ = precision_recall_curve(y_test, prob)
+        ap = average_precision_score(y_test, prob)
+        plt.plot(recall, precision, label=f"{name} AP={ap:.3f}")
+
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curves")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "figure_2_precision_recall.png", dpi=220)
+    plt.close()
+
+
+def plot_calibration(y_test, probabilities):
+    plt.figure(figsize=(7, 6))
+    for name, prob in probabilities.items():
+        frac_pos, mean_pred = calibration_curve(y_test, prob, n_bins=10)
+        plt.plot(mean_pred, frac_pos, marker="o", label=name)
+
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("Mean Predicted Probability")
+    plt.ylabel("Observed Event Frequency")
+    plt.title("Calibration Curves")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "figure_3_calibration.png", dpi=220)
+    plt.close()
+
+
+def plot_feature_importance(model, X_test, y_test):
+    result = permutation_importance(
+        model,
+        X_test,
+        y_test,
+        n_repeats=25,
+        random_state=RANDOM_SEED,
+        scoring="roc_auc",
+    )
+
+    importance = pd.DataFrame(
+        {
+            "feature": X_test.columns,
+            "importance_mean": result.importances_mean,
+            "importance_std": result.importances_std,
+        }
+    ).sort_values("importance_mean", ascending=False)
+
+    importance.to_csv(
+        OUTPUT_DIR / "permutation_feature_importance.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    top = importance.head(15).sort_values("importance_mean")
+
+    plt.figure(figsize=(9, 7))
+    plt.barh(top["feature"], top["importance_mean"], xerr=top["importance_std"])
+    plt.xlabel("Mean ROC-AUC Drop")
+    plt.title("Top Predictive Features")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "figure_4_feature_importance.png", dpi=220)
+    plt.close()
+
+    return importance
+
+
+def plot_uncertainty(uncertainty_df, y_test, n_show=45):
+    df = uncertainty_df.copy()
+    df["observed"] = y_test.to_numpy()
+    df = df.sort_values("risk_mean").tail(n_show).reset_index(drop=True)
+
+    x = np.arange(len(df))
+
+    plt.figure(figsize=(11, 6))
+    plt.errorbar(
+        x,
+        df["risk_mean"],
+        yerr=[
+            df["risk_mean"] - df["risk_lower_95"],
+            df["risk_upper_95"] - df["risk_mean"],
+        ],
+        fmt="o",
+        capsize=3,
+        label="Predicted risk with 95% bootstrap interval",
+    )
+    plt.scatter(x, df["observed"], marker="x", label="Observed outcome")
+    plt.ylim(-0.05, 1.05)
+    plt.xlabel("High predicted-risk test cases")
+    plt.ylabel("Risk probability")
+    plt.title("Individual-Level Uncertainty Intervals")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "figure_5_uncertainty_intervals.png", dpi=220)
+    plt.close()
+
+
+def plot_ablation(ablation_df):
+    df = ablation_df.copy()
+    df = df[df["condition"] != "FULL_MODEL"]
+    df = df.sort_values("auc_drop_from_full")
+
+    plt.figure(figsize=(10, 6))
+    plt.barh(df["condition"], df["auc_drop_from_full"])
+    plt.xlabel("ROC-AUC Drop After Removing Feature Group")
+    plt.title("Ablation Study: Contribution of Feature Groups")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "figure_6_ablation_study.png", dpi=220)
+    plt.close()
+
+
+# ============================================================
+# 6. REPORT GENERATION
+# ============================================================
+
+def make_report(metrics, ablation_df, importance_df):
+    lines = []
+
+    lines.append("Paper-Grade Computational Psychiatry Risk Modeling Prototype")
+    lines.append("=" * 72)
+    lines.append("")
+    lines.append("Research Aim")
+    lines.append("-" * 72)
+    lines.append(
+        "This project demonstrates a dynamic computational psychiatry prototype "
+        "for predicting suicide/crisis risk using synthetic longitudinal behavioral, "
+        "psychological, and contextual data."
+    )
+    lines.append("")
+    lines.append("Scientific Upgrade Over a Basic ML Demo")
+    lines.append("-" * 72)
+    lines.append("1. Latent vulnerability structure")
+    lines.append("2. Longitudinal state evolution")
+    lines.append("3. Temporal feature engineering")
+    lines.append("4. Calibrated probability prediction")
+    lines.append("5. Bootstrap uncertainty intervals")
+    lines.append("6. Ablation study")
+    lines.append("7. Explainability through permutation importance")
+    lines.append("")
+    lines.append("Model Performance")
+    lines.append("-" * 72)
+
+    for name, m in metrics.items():
+        lines.append(f"[{name}]")
+        lines.append(f"Accuracy          : {m['accuracy']:.3f}")
+        lines.append(f"ROC-AUC           : {m['roc_auc']:.3f}")
+        lines.append(f"Average Precision : {m['average_precision']:.3f}")
+        lines.append(f"Brier Score       : {m['brier_score']:.3f}")
+        lines.append(f"Confusion Matrix  : {m['confusion_matrix']}")
+        lines.append("")
+
+    lines.append("Ablation Study")
+    lines.append("-" * 72)
+    lines.append(ablation_df.to_string(index=False))
+    lines.append("")
+
+    lines.append("Top Predictive Features")
+    lines.append("-" * 72)
+    lines.append(importance_df.head(15).to_string(index=False))
+    lines.append("")
+
+    lines.append("Important Disclaimer")
+    lines.append("-" * 72)
+    lines.append(
+        "This project uses synthetic data only. It must not be used for clinical "
+        "decision-making, diagnosis, policing decisions, suicide risk assessment, "
+        "or emergency response. It is intended solely as a research demonstration."
+    )
+
+    report = "\n".join(lines)
+    (OUTPUT_DIR / "research_report_paper_grade.txt").write_text(report, encoding="utf-8")
+
+
+def make_readme():
+    readme = r"""
+# Dynamic Computational Psychiatry Risk Modeling Prototype
+
+## Overview
+
+This project is a paper-oriented research prototype for dynamic psychiatric risk prediction.
+
+## Installation
+
+pip install numpy pandas scikit-learn matplotlib joblib
+
+## Usage
+
+python app.py
+"""
+    (OUTPUT_DIR / "README.md").write_text(readme, encoding="utf-8")
